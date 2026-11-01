@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "engine_path": "C:\\Users\\Rohit\\Desktop\\Chess\\engines\\stockfish-windows-x86-64-universal.exe",
+  "auto_detect": true,
+  "offer_download": true,
+  "depth": 14,
+  "time_limit": 2.0,
+  "multipv": 3,
+  "light_color": "#eeeed2",
+  "dark_color": "#769656",
+  "flip_board": false,
+  "sound": true,
+  "ai_elo": 1400,
+  "accuracy_k": 10.0,
+  "thresholds": {
+    "best": 0.005,
+    "excellent": 0.015,
+    "good": 0.035,
+    "inaccuracy": 0.08,
+    "mistake": 0.18
+  },
+  "great_gap": 0.12,
+  "miss_min_loss": 0.08
+}

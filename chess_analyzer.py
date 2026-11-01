@@ -26,6 +26,7 @@ ACCURACY = 100 * exp(-k * average_loss).  Calibration of k = 10: an average loss
 from __future__ import annotations
 
 import copy
+import datetime
 import hashlib
 import io
 import json
@@ -45,7 +46,7 @@ import time
 import traceback
 import urllib.request
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -61,9 +62,9 @@ except ImportError:
 
 INSTALL_COMMAND = "pip install python-chess pillow matplotlib requests"
 try:
-    import chess
-    import chess.engine
-    import chess.pgn
+    import chess  # type: ignore[import-not-found]
+    import chess.engine  # type: ignore[import-not-found]
+    import chess.pgn  # type: ignore[import-not-found]
 except ImportError:
     _msg = ("The required library 'python-chess' is not installed.\n\nInstall it with:\n    "
             + INSTALL_COMMAND + "\n\nThen start the application again.")
@@ -84,10 +85,10 @@ except ImportError:
 
 HAS_MPL = False
 try:  # optional: evaluation graph through Matplotlib
-    import matplotlib
+    import matplotlib  # type: ignore[import-not-found]
     matplotlib.use("TkAgg")
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.figure import Figure  # type: ignore[reportMissingModuleSource]
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg  # type: ignore[reportMissingModuleSource]
     HAS_MPL = True
 except Exception as _mpl_exc:  # optional dependency boundary: any failure means "use the canvas graph"
     sys.stderr.write(f"Matplotlib unavailable ({_mpl_exc}); using the built-in canvas graph.\n")
@@ -98,6 +99,7 @@ except Exception as _mpl_exc:  # optional dependency boundary: any failure means
 APP_NAME = "Chess Analyzer"
 APP_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 CONFIG_PATH = APP_DIR / "chess_analyzer_settings.json"
+ERROR_LOG = APP_DIR / "chess_analyzer_error.log"
 ENGINE_DIR = APP_DIR / "engines"
 RELEASE_API = "https://api.github.com/repos/official-stockfish/Stockfish/releases/latest"
 SETTINGS_SCHEMA = 1
@@ -243,7 +245,7 @@ def expected_points(cp: float) -> float:
 
 
 def score_to_cp(score) -> int:
-    """Convert a Score seen from the mover's side into a bounded integer.
+    """Convert a Score seen from one side into a bounded integer.
     Forced mates map to +/-(3000 - 10*distance) so they stay separable from ordinary cp."""
     if score.is_mate():
         mate = score.mate()
@@ -272,6 +274,26 @@ def fmt_cp_white(cp: int) -> str:
 
 def material(board: chess.Board, color: bool) -> int:
     return sum(PIECE_VALUES[p.piece_type] for p in board.piece_map().values() if p.color == color)
+
+
+def pv_to_san(board: chess.Board, ucis: list, limit: int = 10) -> str:
+    """Render an engine line (Universal Chess Interface moves) as numbered standard notation."""
+    b = board.copy(stack=False)
+    out: list[str] = []
+    for i, text in enumerate(ucis[:limit]):
+        try:
+            mv = chess.Move.from_uci(text)
+        except ValueError:
+            break
+        if mv not in b.legal_moves:
+            break
+        if b.turn == chess.WHITE:
+            out.append(f"{b.fullmove_number}.")
+        elif i == 0:
+            out.append(f"{b.fullmove_number}...")
+        out.append(b.san(mv))
+        b.push(mv)
+    return " ".join(out)
 
 
 def qsearch(board: chess.Board, alpha: int, beta: int, depth: int = 6) -> int:
@@ -651,9 +673,14 @@ def ai_profile(target: int, options) -> AIProfile:
     skill = int(max(0, min(20, round((target - 800) / 85.0))))
     depth_cap = int(max(1, round(1 + (target - 800) / 130.0)))
     time_cap = 0.05 + (target - 800) / 1700.0
-    window = max(0.0, (1700 - target) / 900.0 * 0.15)
-    prob = max(0.0, (1800 - target) / 1000.0 * 0.5)
-    mpv = 4 if prob > 0 else 1
+    if has_elo:
+        elo_floor = options["UCI_Elo"].min
+        weakness = max(0.0, min(1.0, (elo_floor - target) / max(1, elo_floor - 800)))
+    else:
+        weakness = max(0.0, min(1.0, (1800 - target) / 1000.0))
+    window = 0.4 * weakness
+    prob = 0.9 * weakness
+    mpv = 4 if weakness > 0 else 1
     return AIProfile({"UCI_LimitStrength": False, "Skill Level": skill},
                      chess.engine.Limit(depth=depth_cap, time=time_cap), mpv, window, prob,
                      f"Skill Level {skill}, depth {depth_cap}")
@@ -668,6 +695,7 @@ class EngineManager:
         self._engine: Optional[chess.engine.SimpleEngine] = None
         self._profile_key = None
         self._closing = False
+        self._live_stop: Optional[threading.Event] = None
         self._cache: dict = {}
         self.path = ""
         self.name = ""
@@ -683,6 +711,12 @@ class EngineManager:
 
     def clear_cache(self) -> None:
         self._cache.clear()
+
+    def interrupt_live(self) -> None:
+        """Ask a running live analysis stream to stop so another request can use the engine."""
+        event = self._live_stop
+        if event is not None:
+            event.set()
 
     def _close_locked(self) -> None:
         engine, self._engine = self._engine, None
@@ -714,7 +748,8 @@ class EngineManager:
             self.log(f"Engine started: {self.name} ({path})")
 
     def stop(self) -> None:
-        got = self._lock.acquire(timeout=1.0)
+        self.interrupt_live()
+        got = self._lock.acquire(timeout=1.5)
         try:
             if got:
                 self._close_locked()
@@ -730,6 +765,7 @@ class EngineManager:
         self.stop()
 
     def _call(self, fn: Callable):
+        self.interrupt_live()
         with self._lock:
             last: Optional[BaseException] = None
             for _ in range(2):
@@ -802,6 +838,41 @@ class EngineManager:
         self._cache[key] = result
         return result
 
+    def stream(self, board: chess.Board, multipv: int, stop: threading.Event, on_info: Callable,
+               depth_cap: int = 28) -> None:
+        """Continuous analysis for the analysis board. Runs until `stop` is set, the depth cap is
+        reached, or another request needs the engine. `on_info` receives the latest info per line."""
+        self.interrupt_live()
+        self._live_stop = stop
+        with self._lock:
+            if stop.is_set() or self._closing:
+                return
+            if self._engine is None:
+                if not self.path:
+                    raise EngineUnavailable("No engine is configured.")
+                self.start(self.path)
+            engine = self._engine
+            latest: dict = {}
+            try:
+                self._apply(engine, self.analysis_options())
+                last_post = 0.0
+                with engine.analysis(board, chess.engine.Limit(depth=depth_cap), multipv=multipv) as analysis:
+                    for info in analysis:
+                        if stop.is_set() or self._closing:
+                            break
+                        if "pv" in info and "score" in info:
+                            latest[info.get("multipv", 1)] = info
+                            now = time.time()
+                            if now - last_post >= 0.15:
+                                last_post = now
+                                on_info([latest[k] for k in sorted(latest)])
+                if latest and not stop.is_set():
+                    on_info([latest[k] for k in sorted(latest)])
+            except (chess.engine.EngineTerminatedError, BrokenPipeError, ConnectionError, OSError) as exc:
+                self.log(f"Engine process ended unexpectedly ({exc}).")
+                self._engine_dead()
+                raise EngineUnavailable(f"The engine terminated: {exc}") from exc
+
     def best_move_for_elo(self, board: chess.Board, target: int) -> chess.Move:
         def run(engine):
             prof = ai_profile(target, engine.options)
@@ -826,8 +897,7 @@ def pick_candidate(cands: list, prof: AIProfile) -> chess.Move:
         return best_move
     best_ep = expected_points(best_cp)
     pool = [(m, best_ep - expected_points(c)) for m, c in cands if best_ep - expected_points(c) <= prof.window]
-    weights = [math.exp(-loss / 0.05) for _, loss in pool]
-    return random.choices([m for m, _ in pool], weights=weights, k=1)[0]
+    return random.choice([m for m, _ in pool])
 
 
 # =============================================================================
@@ -1088,7 +1158,7 @@ def build_report(analysis: GameAnalysis, k: float) -> str:
 
 
 # =============================================================================
-# 10. GUI HELPERS
+# 10. GUI HELPERS AND WIDGETS
 # =============================================================================
 def blend(c1: str, c2: str, t: float) -> str:
     a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
@@ -1121,6 +1191,9 @@ def setup_style(root: tk.Tk) -> None:
            selectbackground=[("readonly", PANEL2)], selectforeground=[("readonly", FG)])
     st.configure("TCheckbutton", background=PANEL, foreground=FG)
     st.map("TCheckbutton", background=[("active", PANEL)])
+    st.configure("TNotebook", background=PANEL, borderwidth=0)
+    st.configure("TNotebook.Tab", background="#3a3836", foreground=FG, padding=(12, 5))
+    st.map("TNotebook.Tab", background=[("selected", "#4a4846")])
     st.configure("Horizontal.TProgressbar", troughcolor=PANEL2, background=ACCENT)
     root.option_add("*TCombobox*Listbox.background", PANEL2)
     root.option_add("*TCombobox*Listbox.foreground", FG)
@@ -1130,6 +1203,13 @@ def setup_style(root: tk.Tk) -> None:
 def make_text(parent, height: int = 6, **kw) -> tk.Text:
     return tk.Text(parent, height=height, bg=PANEL2, fg=FG, insertbackground=FG, relief="flat", wrap="word",
                    font=(UI_FONT, 9), padx=6, pady=4, highlightthickness=0, **kw)
+
+
+def set_readonly_text(widget: tk.Text, text: str) -> None:
+    widget.configure(state="normal")
+    widget.delete("1.0", "end")
+    widget.insert("1.0", text)
+    widget.configure(state="disabled")
 
 
 def ask_promotion(parent, color: bool) -> int:
@@ -1151,8 +1231,12 @@ def ask_promotion(parent, color: bool) -> int:
 
 
 class BoardView(tk.Canvas):
-    """Interactive board: click or drag moves, highlights, legal-move dots, coordinates, arrow."""
+    """Interactive board.
+    - Left click / drag moves pieces when `interactive()` allows it for the side to move.
+    - Right-drag draws arrows. Right-click on one square toggles a circle.
+    - `edit_handler(square, erase)` turns the board into a board editor."""
     COORD = 18
+    MARK_COLOR = "#f0a030"
 
     def __init__(self, master, settings: Settings, on_move: Optional[Callable] = None,
                  interactive: Optional[Callable] = None, size: int = 520) -> None:
@@ -1160,25 +1244,42 @@ class BoardView(tk.Canvas):
         self.settings = settings
         self.on_move = on_move
         self.interactive = interactive or (lambda: False)
+        self.edit_handler: Optional[Callable] = None
+        self.on_layout: Optional[Callable] = None
         self.board = chess.Board()
         self.flipped = False
         self.last_move: Optional[chess.Move] = None
         self.arrow: Optional[chess.Move] = None
+        self.marks: list[tuple[int, int]] = []
         self.selected: Optional[int] = None
         self.drag: Optional[list] = None
         self.drag_hide: Optional[int] = None
+        self.mode: Optional[str] = None
+        self.mark_start = 0
+        self.mark_end = 0
+        self._last_edit: Optional[int] = None
+        self._edit_erase = False
         self.sq = 60
         self.bind("<Configure>", lambda e: self.redraw())
         self.bind("<ButtonPress-1>", self._press)
         self.bind("<B1-Motion>", self._motion)
         self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<ButtonPress-3>", self._press_right)
+        self.bind("<B3-Motion>", self._motion)
+        self.bind("<ButtonRelease-3>", self._release)
 
     def set_position(self, board: chess.Board, last_move=None, arrow=None) -> None:
-        self.board, self.last_move, self.arrow, self.selected = board.copy(), last_move, arrow, None
+        if board.fen() != self.board.fen():
+            self.marks = []
+        self.board, self.last_move, self.arrow, self.selected = board.copy(stack=False), last_move, arrow, None
         self.redraw()
 
     def set_flipped(self, flipped: bool) -> None:
         self.flipped = flipped
+        self.redraw()
+
+    def clear_marks(self) -> None:
+        self.marks = []
         self.redraw()
 
     def _square_xy(self, square: int) -> tuple[int, int]:
@@ -1202,6 +1303,13 @@ class BoardView(tk.Canvas):
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             self.create_text(cx + dx, cy + dy, text=glyph, font=font, fill=edge, tags=tag)
         self.create_text(cx, cy, text=glyph, font=font, fill=fill, tags=tag)
+
+    def _arrow(self, a: int, b: int, color: str, tag: str = "arrow") -> None:
+        x1, y1 = self._square_xy(a)
+        x2, y2 = self._square_xy(b)
+        sq = self.sq
+        self.create_line(x1 + sq / 2, y1 + sq / 2, x2 + sq / 2, y2 + sq / 2, fill=color, width=max(4, sq // 8),
+                         arrow=tk.LAST, arrowshape=(16, 20, 8), capstyle="round", tags=tag)
 
     def redraw(self) -> None:
         self.delete("all")
@@ -1241,49 +1349,100 @@ class BoardView(tk.Canvas):
             x, y = self._square_xy(square)
             self._draw_piece(x + sq / 2, y + sq / 2, piece, "piece")
         if self.arrow:
-            x1, y1 = self._square_xy(self.arrow.from_square)
-            x2, y2 = self._square_xy(self.arrow.to_square)
-            self.create_line(x1 + sq / 2, y1 + sq / 2, x2 + sq / 2, y2 + sq / 2, fill="#3d9be9",
-                             width=max(4, sq // 8), arrow=tk.LAST, arrowshape=(16, 20, 8), capstyle="round")
+            self._arrow(self.arrow.from_square, self.arrow.to_square, "#3d9be9")
+        for a, b in self.marks:
+            if a == b:
+                x, y = self._square_xy(a)
+                self.create_oval(x + 3, y + 3, x + sq - 3, y + sq - 3, outline=self.MARK_COLOR,
+                                 width=max(3, sq // 14))
+            else:
+                self._arrow(a, b, self.MARK_COLOR)
+        if self.on_layout:
+            self.on_layout(8 * sq)
 
     def _is_target(self, square: int) -> bool:
         return any(m.from_square == self.selected and m.to_square == square for m in self.board.legal_moves)
 
+    def _toggle_mark(self, a: int, b: int) -> None:
+        if (a, b) in self.marks:
+            self.marks.remove((a, b))
+        else:
+            self.marks.append((a, b))
+
     def _press(self, e) -> None:
         square = self._xy_square(e.x, e.y)
         if square is None:
+            return
+        if self.edit_handler:
+            self.mode, self._last_edit, self._edit_erase = "edit", square, False
+            self.edit_handler(square, False)
             return
         if self.selected is not None and square != self.selected and self._is_target(square):
             self._attempt(self.selected, square)
             return
         piece = self.board.piece_at(square)
         if piece and piece.color == self.board.turn and self.interactive():
-            self.selected, self.drag = square, [square, False]
+            self.marks = []
+            self.selected, self.drag, self.mode = square, [square, False], "piece"
+            self.redraw()
         else:
-            self.selected, self.drag = None, None
-        self.redraw()
+            self.selected = None
+            self.mode = None
+            self.redraw()
+
+    def _press_right(self, e) -> None:
+        square = self._xy_square(e.x, e.y)
+        if square is None:
+            return
+        if self.edit_handler:
+            self.mode, self._last_edit, self._edit_erase = "edit", square, True
+            self.edit_handler(square, True)
+            return
+        self.mode, self.mark_start, self.mark_end = "mark", square, square
 
     def _motion(self, e) -> None:
-        if not self.drag:
-            return
-        if not self.drag[1]:
-            self.drag[1] = True
-            self.drag_hide = self.drag[0]
-            self.redraw()
-        self.delete("drag")
-        piece = self.board.piece_at(self.drag[0])
-        if piece:
-            self._draw_piece(e.x, e.y, piece, "drag")
+        square = self._xy_square(e.x, e.y)
+        if self.mode == "piece" and self.drag:
+            if not self.drag[1]:
+                self.drag[1] = True
+                self.drag_hide = self.drag[0]
+                self.redraw()
+            self.delete("drag")
+            piece = self.board.piece_at(self.drag[0])
+            if piece:
+                self._draw_piece(e.x, e.y, piece, "drag")
+        elif self.mode == "mark":
+            if square is not None and square != self.mark_end:
+                self.mark_end = square
+                self.delete("preview")
+                if self.mark_end != self.mark_start:
+                    self._arrow(self.mark_start, self.mark_end, self.MARK_COLOR, "preview")
+        elif self.mode == "edit" and self.edit_handler:
+            if square is not None and square != self._last_edit:
+                self._last_edit = square
+                self.edit_handler(square, self._edit_erase)
 
     def _release(self, e) -> None:
-        drag, self.drag = self.drag, None
-        self.drag_hide = None
-        if drag and drag[1]:
-            dest = self._xy_square(e.x, e.y)
-            if dest is not None and dest != drag[0] and self._is_target(dest):
-                self._attempt(drag[0], dest)
-                return
-        self.redraw()
+        mode, self.mode = self.mode, None
+        if mode == "piece":
+            drag, self.drag = self.drag, None
+            self.drag_hide = None
+            if drag and drag[1]:
+                dest = self._xy_square(e.x, e.y)
+                if dest is not None and dest != drag[0] and self._is_target(dest):
+                    self._attempt(drag[0], dest)
+                    return
+            self.redraw()
+        elif mode == "mark":
+            self.delete("preview")
+            end = self._xy_square(e.x, e.y)
+            if end is None:
+                end = self.mark_end
+            if end == self.mark_start:
+                self._toggle_mark(end, end)
+            else:
+                self._toggle_mark(self.mark_start, end)
+            self.redraw()
 
     def _attempt(self, frm: int, to: int) -> None:
         piece = self.board.piece_at(frm)
@@ -1296,6 +1455,50 @@ class BoardView(tk.Canvas):
             self.on_move(move)
         else:
             self.redraw()
+
+
+class EvalBar(tk.Canvas):
+    """Vertical evaluation bar (White at the bottom unless the board is flipped)."""
+
+    def __init__(self, master) -> None:
+        super().__init__(master, width=34, height=100, bg="#403d39", highlightthickness=0)
+        self.cp = 0
+        self.text = "0.0"
+        self.flipped = False
+        self.board_h = 0
+        self.bind("<Configure>", lambda e: self.draw())
+
+    def set_eval(self, cp: int, text: str) -> None:
+        self.cp, self.text = cp, text
+        self.draw()
+
+    def set_board_height(self, height: int) -> None:
+        if height != self.board_h:
+            self.board_h = height
+            self.configure(height=height)
+            self.draw()
+
+    def draw(self) -> None:
+        self.delete("all")
+        h = self.board_h or max(self.winfo_height(), 100)
+        w = max(self.winfo_width(), 34)
+        if abs(self.cp) >= MATE_THRESHOLD:
+            ep = 1.0 if self.cp > 0 else 0.0
+        else:
+            ep = expected_points(max(-1500, min(1500, self.cp)))
+        white_h = h * ep
+        if not self.flipped:
+            self.create_rectangle(0, 0, w, h - white_h, fill="#403d39", outline="")
+            self.create_rectangle(0, h - white_h, w, h, fill="#f0f0f0", outline="")
+        else:
+            self.create_rectangle(0, 0, w, white_h, fill="#f0f0f0", outline="")
+            self.create_rectangle(0, white_h, w, h, fill="#403d39", outline="")
+        self.create_line(0, h / 2, w, h / 2, fill="#888888")
+        white_leads = self.cp >= 0
+        at_bottom = white_leads != self.flipped
+        y = h - 10 if at_bottom else 10
+        self.create_text(w / 2, y, text=self.text, font=(UI_FONT, 8, "bold"),
+                         fill="#202020" if white_leads else "#f0f0f0")
 
 
 class EvalGraph(ttk.Frame):
@@ -1397,6 +1600,13 @@ class EvalGraph(ttk.Frame):
                 cv.create_text(left + i * step, h - 8, text=str(i // 2), fill=MUTED, font=(UI_FONT, 7))
 
 
+def clipboard_text(root: tk.Misc) -> str:
+    try:
+        return root.clipboard_get()
+    except tk.TclError:
+        return ""
+
+
 # =============================================================================
 # 13. PGN ANALYSIS INTERFACE (board + analysis dashboard)
 # =============================================================================
@@ -1410,6 +1620,8 @@ class AnalysisPage(ttk.Frame):
         self.moves: list[chess.Move] = []
         self.analysis: Optional[GameAnalysis] = None
         self.cur = 0
+        self.exploration: Optional[chess.Board] = None
+        self.exploration_start: Optional[int] = None
         self.token = 0
         self.busy = False
         self.cancel = threading.Event()
@@ -1422,48 +1634,66 @@ class AnalysisPage(ttk.Frame):
         for kind, fn in (("analysis_progress", self.on_progress), ("analysis_done", self.on_done),
                          ("analysis_cancelled", self.on_cancelled), ("analysis_error", self.on_error)):
             app.register(kind, fn)
-        app.root.bind("<Left>", lambda e: self._key(self.prev))
-        app.root.bind("<Right>", lambda e: self._key(self.next))
 
-    def _key(self, fn: Callable) -> None:
-        focus = self.focus_get()
-        if self.app.current_page == "analysis" and not isinstance(focus, (tk.Entry, tk.Text, ttk.Entry,
-                                                                           ttk.Combobox, ttk.Spinbox)):
-            fn()
+    def step(self, direction: int) -> None:
+        self.goto(self.cur + direction)
+
+    def set_flip(self, flipped: bool) -> None:
+        self.view.flipped = flipped
+        self.evalbar.flipped = flipped
+        self.view.redraw()
+        self.evalbar.draw()
 
     def _build_left(self) -> None:
         left = ttk.Frame(self)
         left.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
-        self.view = BoardView(left, self.app.settings)
-        self.view.grid(row=0, column=0, sticky="nsew")
+        row = ttk.Frame(left)
+        row.grid(row=0, column=0, sticky="nsew")
+        row.rowconfigure(0, weight=1)
+        row.columnconfigure(1, weight=1)
+        self.evalbar = EvalBar(row)
+        self.evalbar.grid(row=0, column=0, sticky="n", padx=(0, 4))
+        self.evalbar.grid_remove()
+        self.view = BoardView(row, self.app.settings, on_move=self.on_exploration_move, interactive=lambda: True)
+        self.view.grid(row=0, column=1, sticky="nsew")
+        self.view.on_layout = self.evalbar.set_board_height
         self.pos_label = ttk.Label(left, text="Load a game to begin.", style="Big.TLabel")
         self.pos_label.grid(row=1, column=0, sticky="w", pady=(6, 2))
         nav = ttk.Frame(left)
         nav.grid(row=2, column=0, sticky="w")
         for text, cmd in (("|<", self.first), ("<", self.prev), (">", self.next), (">|", self.last),
-                          ("Flip board", self.flip)):
-            ttk.Button(nav, text=text, command=cmd, width=10 if len(text) > 2 else 4).pack(side="left", padx=2)
+                          ("Flip board", self.flip), ("Analyze position", self.to_board)):
+            ttk.Button(nav, text=text, command=cmd, width=15 if len(text) > 4 else 4).pack(side="left", padx=2)
+        opts = ttk.Frame(left)
+        opts.grid(row=3, column=0, sticky="w", pady=(4, 0))
         self.show_best = tk.BooleanVar(value=True)
-        ttk.Checkbutton(nav, text="Show engine's best move", variable=self.show_best,
-                        command=self.refresh_board).pack(side="left", padx=10)
+        ttk.Checkbutton(opts, text="Show engine's best move", variable=self.show_best,
+                        command=self.refresh_board).pack(side="left")
+        ttk.Label(left, text="Left-click or drag pieces to explore moves; use the move controls to return to the game. "
+                  "Right-drag to draw arrows; right-click a square to draw a circle. Scroll to step through moves.",
+                  style="Muted.TLabel", wraplength=520
+                  ).grid(row=4, column=0, sticky="w", pady=(4, 0))
 
     def _build_right(self) -> None:
         right = ttk.Frame(self)
         right.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=8)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(5, weight=1)
+        right.rowconfigure(6, weight=1)
+        row0 = ttk.Frame(right)
+        row0.grid(row=0, column=0, sticky="ew")
+        ttk.Button(row0, text="Open PGN file...", command=self.open_file).pack(side="left")
+        ttk.Button(row0, text="Paste PGN", style="Accent.TButton", command=self.paste_text).pack(side="left", padx=4)
+        ttk.Button(row0, text="Type/edit PGN...", command=self.edit_text).pack(side="left")
         row1 = ttk.Frame(right)
-        row1.grid(row=0, column=0, sticky="ew")
-        ttk.Button(row1, text="Open PGN file...", command=self.open_file).pack(side="left")
-        ttk.Button(row1, text="Paste PGN text...", command=self.paste_text).pack(side="left", padx=4)
+        row1.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self.game_var = tk.StringVar()
-        self.game_box = ttk.Combobox(row1, textvariable=self.game_var, state="readonly", width=38)
+        self.game_box = ttk.Combobox(row1, textvariable=self.game_var, state="readonly", width=50)
         self.game_box.pack(side="left", fill="x", expand=True)
         self.game_box.bind("<<ComboboxSelected>>", lambda e: self.select_game(self.game_box.current()))
         row2 = ttk.Frame(right)
-        row2.grid(row=1, column=0, sticky="ew", pady=4)
+        row2.grid(row=2, column=0, sticky="ew", pady=4)
         ttk.Label(row2, text="Search depth:").pack(side="left")
         self.depth_var = tk.IntVar(value=self.app.settings.data["depth"])
         ttk.Spinbox(row2, from_=4, to=30, width=4, textvariable=self.depth_var).pack(side="left", padx=4)
@@ -1473,11 +1703,11 @@ class AnalysisPage(ttk.Frame):
         self.btn_cancel = ttk.Button(row2, text="Cancel", command=self.cancel_analysis, state="disabled")
         self.btn_cancel.pack(side="left")
         self.progress = ttk.Progressbar(right, mode="determinate", maximum=100)
-        self.progress.grid(row=2, column=0, sticky="ew")
+        self.progress.grid(row=3, column=0, sticky="ew")
         self.status = ttk.Label(right, text="No game loaded.", style="Muted.TLabel")
-        self.status.grid(row=3, column=0, sticky="w")
+        self.status.grid(row=4, column=0, sticky="w")
         mid = ttk.Frame(right)
-        mid.grid(row=4, column=0, sticky="ew", pady=4)
+        mid.grid(row=5, column=0, sticky="ew", pady=4)
         mid.columnconfigure(0, weight=1)
         self.summary = ttk.Frame(mid)
         self.summary.grid(row=0, column=0, sticky="nw")
@@ -1508,7 +1738,7 @@ class AnalysisPage(ttk.Frame):
                 lab.grid(row=r, column=c)
                 self.dist_labels[(g, side)] = lab
         lower = ttk.Frame(right)
-        lower.grid(row=5, column=0, sticky="nsew")
+        lower.grid(row=6, column=0, sticky="nsew")
         lower.columnconfigure(0, weight=1)
         lower.rowconfigure(2, weight=1)
         self.graph = EvalGraph(lower, self.goto)
@@ -1538,6 +1768,8 @@ class AnalysisPage(ttk.Frame):
         sb.grid(row=2, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.tree.bind(sequence, self._on_move_list_wheel)
         self.details = make_text(lower, height=5)
         self.details.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         self.details.configure(state="disabled")
@@ -1560,37 +1792,69 @@ class AnalysisPage(ttk.Frame):
         self.load_text(text or "")
 
     def paste_text(self) -> None:
+        """One click: load straight from the clipboard (opens the editor only if the clipboard is empty)."""
+        clip = clipboard_text(self.app.root)
+        if clip.strip():
+            self.load_text(clip)
+        else:
+            self.edit_text()
+
+    def edit_text(self) -> None:
         top = tk.Toplevel(self.app.root)
-        top.title("Paste Portable Game Notation (PGN)")
+        top.title("Type or paste Portable Game Notation (PGN)")
         top.configure(bg=PANEL)
+        top.transient(self.app.root)
         txt = make_text(top, height=20, width=80)
         txt.pack(fill="both", expand=True, padx=8, pady=8)
+        clip = clipboard_text(self.app.root)
+        if clip.strip():
+            txt.insert("1.0", clip)
 
-        def go() -> None:
+        def go(_event=None):
             content = txt.get("1.0", "end")
             top.destroy()
             self.load_text(content)
+            return "break"
 
-        ttk.Button(top, text="Load", style="Accent.TButton", command=go).pack(pady=(0, 8))
+        row = ttk.Frame(top)
+        row.pack(pady=(0, 8))
+        ttk.Button(row, text="Load (Ctrl+Enter)", style="Accent.TButton", command=go).pack(side="left", padx=4)
+        ttk.Button(row, text="Cancel", command=top.destroy).pack(side="left", padx=4)
+        txt.bind("<Control-Return>", go)
+        try:
+            top.wait_visibility()
+            top.grab_set()
+        except tk.TclError as exc:
+            sys.stderr.write(f"Dialog grab failed: {exc}\n")
+        top.focus_force()
+        txt.focus_force()
 
     def load_text(self, text: str) -> None:
-        if self.busy:
-            messagebox.showinfo(APP_NAME, "Please cancel the running analysis first.")
-            return
         games, messages = parse_pgn_text(text)
         if messages:
             shown = "\n".join(messages[:12]) + (f"\n... and {len(messages) - 12} more" if len(messages) > 12 else "")
             (messagebox.showwarning if games else messagebox.showerror)("PGN problems", shown)
         if not games:
             return
+        self._abort_running()
         self.games = games
         self.game_box["values"] = [game_label(g, i + 1) for i, g in enumerate(games)]
         self.game_box.current(0)
         self.select_game(0)
 
+    def load_game_object(self, game, autostart: bool = False) -> None:
+        self._abort_running()
+        self.games = [game]
+        self.game_box["values"] = [game_label(game, 1)]
+        self.game_box.current(0)
+        self.select_game(0)
+        if autostart:
+            self.start_analysis()
+
     def select_game(self, idx: int) -> None:
-        if self.busy or idx < 0 or idx >= len(self.games):
+        if idx < 0 or idx >= len(self.games):
             return
+        self._abort_running()
         game = self.games[idx]
         try:
             board = game.board()
@@ -1607,6 +1871,8 @@ class AnalysisPage(ttk.Frame):
         self.status.configure(text=f"{h.get('White', '?')} vs {h.get('Black', '?')} | {h.get('Event', '?')} | "
                               f"{h.get('Date', '?')} | {h.get('Result', '*')} | {len(moves)} moves | "
                               f"Opening: {h.get('Opening', 'n/a')}")
+        self.progress["value"] = 0
+        self.evalbar.grid_remove()
         self.graph.set_values([])
         self._clear_summary()
         self._rebuild_list()
@@ -1632,19 +1898,29 @@ class AnalysisPage(ttk.Frame):
         self.goto(len(self.moves))
 
     def flip(self) -> None:
-        self.view.set_flipped(not self.view.flipped)
+        self.set_flip(not self.view.flipped)
+
+    def to_board(self) -> None:
+        if not self.positions:
+            messagebox.showinfo(APP_NAME, "Load a game first.")
+            return
+        self.app.open_in_board(self.positions[0], self.moves, self.cur)
 
     def goto(self, idx: int) -> None:
         if not self.positions:
             return
         self.cur = max(0, min(len(self.moves), idx))
+        self.exploration = None
+        self.exploration_start = None
         self.refresh_board()
         self.graph.set_current(self.cur)
         self._syncing = True
         try:
-            if self.cur > 0 and self.tree.exists(str(self.cur)):
-                self.tree.selection_set(str(self.cur))
-                self.tree.see(str(self.cur))
+            item = str(self.cur)
+            if self.cur > 0 and self.tree.exists(item):
+                if self.tree.selection() != (item,):
+                    self.tree.selection_set(item)
+                self.tree.see(item)
             elif self.tree.selection():
                 self.tree.selection_remove(self.tree.selection())
         finally:
@@ -1658,24 +1934,56 @@ class AnalysisPage(ttk.Frame):
     def refresh_board(self) -> None:
         if not self.positions:
             return
+        if self.exploration is not None:
+            last = self.exploration.peek() if self.exploration.move_stack else None
+            self.view.set_position(self.exploration, last)
+            self.evalbar.grid_remove()
+            self.pos_label.configure(text="Exploration from the current game position; original game and analysis unchanged.")
+            return
         last = self.moves[self.cur - 1] if self.cur > 0 else None
         arrow = None
         if self.show_best.get() and self.analysis and self.cur < len(self.moves):
             uci = self.analysis.results[self.cur].best_uci
             arrow = chess.Move.from_uci(uci) if uci else None
         self.view.set_position(self.positions[self.cur], last, arrow)
+        if self.analysis and self.cur < len(self.analysis.graph_values):
+            cp = self.analysis.graph_values[self.cur]
+            self.evalbar.set_eval(cp, fmt_cp_white(cp) if abs(cp) >= MATE_THRESHOLD else f"{cp / 100:+.1f}")
+            self.evalbar.grid()
         if self.cur == 0:
             self.pos_label.configure(text="Starting position")
         else:
             san = self.positions[self.cur - 1].san(self.moves[self.cur - 1])
             self.pos_label.configure(text=f"Move {self._move_label(self.cur)} {san}   (position {self.cur}/{len(self.moves)})")
 
+    def on_exploration_move(self, move: chess.Move) -> None:
+        if not self.positions:
+            return
+        board = self.exploration if self.exploration is not None else self.positions[self.cur]
+        if move not in board.legal_moves:
+            return
+        if self.exploration is None:
+            self.exploration = board.copy()
+            self.exploration_start = self.cur
+        self.exploration.push(move)
+        self.refresh_board()
+
     def _on_tree_select(self, _e) -> None:
         if self._syncing:
             return
         sel = self.tree.selection()
-        if sel:
+        if sel and sel[0] != str(self.cur):
             self.goto(int(sel[0]))
+
+    def _on_move_list_wheel(self, event) -> str:
+        if getattr(event, "num", None) == 4:
+            direction = -1
+        elif getattr(event, "num", None) == 5:
+            direction = 1
+        else:
+            direction = -1 if event.delta > 0 else 1
+        self.step(direction)
+        return "break"
 
     def _rebuild_list(self) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -1715,15 +2023,18 @@ class AnalysisPage(ttk.Frame):
                     f"(before {r.ep_best:.3f}, after {r.ep_played:.3f}).  Phase: {r.phase}."
                     + (f"  Opening: {r.opening}." if r.opening else "")
                     + f"  Evaluation after the move (White's view): {fmt_cp_white(r.eval_white)}.")
-        self.details.configure(state="normal")
-        self.details.delete("1.0", "end")
-        self.details.insert("1.0", text)
-        self.details.configure(state="disabled")
+        set_readonly_text(self.details, text)
 
     # ---- analysis ----
-    def start_analysis(self) -> None:
+    def _abort_running(self) -> None:
+        """Cancel a running analysis. Stale messages are ignored through the token."""
         if self.busy:
-            return
+            self.cancel.set()
+            self.token += 1
+            self._finish_ui()
+            self.progress["value"] = 0
+
+    def start_analysis(self) -> None:
         if self.game is None:
             messagebox.showinfo(APP_NAME, "Load a Portable Game Notation (PGN) game first.")
             return
@@ -1734,15 +2045,17 @@ class AnalysisPage(ttk.Frame):
             return
         if not self.app.ensure_engine():
             return
+        self._abort_running()
         d = self.app.settings.data
         self.busy = True
         self.token += 1
         self.cancel = threading.Event()
         self.analysis = None
+        self.evalbar.grid_remove()
         self._clear_summary()
         self._rebuild_list()
         self.progress["value"] = 0
-        self.btn_analyze.state(["disabled"])
+        self.status.configure(text="Starting analysis...")
         self.btn_cancel.state(["!disabled"])
         threading.Thread(target=self._worker, daemon=True,
                          args=(self.token, self.game, depth, float(d["time_limit"]), int(d["multipv"]), self.cancel)).start()
@@ -1760,16 +2073,15 @@ class AnalysisPage(ttk.Frame):
 
     def cancel_analysis(self) -> None:
         if self.busy:
-            self.cancel.set()
-            self.status.configure(text="Cancelling...")
+            self._abort_running()
+            self.status.configure(text="Analysis cancelled.")
 
     def _finish_ui(self) -> None:
         self.busy = False
-        self.btn_analyze.state(["!disabled"])
         self.btn_cancel.state(["disabled"])
 
     def on_progress(self, msg) -> None:
-        if msg[1] == self.token:
+        if msg[1] == self.token and self.busy:
             self.progress["value"] = 100.0 * msg[2] / max(1, msg[3])
             self.status.configure(text=f"Analyzing position {msg[2]} of {msg[3]}...")
 
@@ -1793,6 +2105,7 @@ class AnalysisPage(ttk.Frame):
         self.progress["value"] = 100
         self.status.configure(text="Analysis complete.")
         self.graph.set_values(self.analysis.graph_values)
+        self.evalbar.grid()
         self.render_summary()
         self._rebuild_list()
         self.goto(self.cur)
@@ -1816,6 +2129,508 @@ class AnalysisPage(ttk.Frame):
 
 
 # =============================================================================
+# 13b. ANALYSIS BOARD (free play, board editor, live evaluation bar)
+# =============================================================================
+class BoardPage(ttk.Frame):
+    def __init__(self, master, app: "ChessApp") -> None:
+        super().__init__(master)
+        self.app = app
+        self.start_board = chess.Board()
+        self.moves: list[chess.Move] = []
+        self.boards: list[chess.Board] = [chess.Board()]
+        self.pos = 0
+        self.editing = False
+        self.edit_board = chess.Board()
+        self.live_token = 0
+        self.live_stop = threading.Event()
+        self.engine_on = tk.BooleanVar(value=False)
+        self.lines_var = tk.IntVar(value=max(1, min(5, app.settings.data["multipv"])))
+        self.brush = tk.StringVar(value="P")
+        self.turn_var = tk.StringVar(value="White")
+        self.castle = {c: tk.BooleanVar(value=True) for c in "KQkq"}
+        self.fen_var = tk.StringVar()
+        self.columnconfigure(0, weight=5)
+        self.columnconfigure(1, weight=3)
+        self.rowconfigure(0, weight=1)
+        self._build_left()
+        self._build_right()
+        app.register("live_info", self.on_live)
+        app.register("live_error", self.on_live_error)
+        self.after_change()
+
+    # ---- layout ----
+    def _build_left(self) -> None:
+        left = ttk.Frame(self)
+        left.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        left.rowconfigure(0, weight=1)
+        left.columnconfigure(0, weight=1)
+        row = ttk.Frame(left)
+        row.grid(row=0, column=0, sticky="nsew")
+        row.rowconfigure(0, weight=1)
+        row.columnconfigure(1, weight=1)
+        self.evalbar = EvalBar(row)
+        self.evalbar.grid(row=0, column=0, sticky="n", padx=(0, 4))
+        self.evalbar.grid_remove()
+        self.view = BoardView(row, self.app.settings, on_move=self.on_user_move, interactive=lambda: not self.editing)
+        self.view.grid(row=0, column=1, sticky="nsew")
+        self.view.on_layout = self.evalbar.set_board_height
+        self.status = ttk.Label(left, text="", style="Big.TLabel")
+        self.status.grid(row=1, column=0, sticky="w", pady=(6, 2))
+        nav = ttk.Frame(left)
+        nav.grid(row=2, column=0, sticky="w")
+        for text, cmd, width in (("|<", lambda: self.goto(0), 4), ("<", lambda: self.step(-1), 4),
+                                 (">", lambda: self.step(1), 4), (">|", lambda: self.goto(len(self.moves)), 4),
+                                 ("Flip board", self.flip, 11), ("Clear arrows", self.view.clear_marks, 12)):
+            ttk.Button(nav, text=text, command=cmd, width=width).pack(side="left", padx=2)
+        ttk.Label(left, text="Left-click or drag pieces to play both sides. Right-drag to draw arrows; right-click "
+                  "a square to draw a circle. Scroll the mouse wheel to step through moves.",
+                  style="Muted.TLabel", wraplength=520).grid(row=4, column=0, sticky="w", pady=(4, 0))
+
+    def _build_right(self) -> None:
+        right = ttk.Frame(self)
+        right.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=8)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(3, weight=1)
+        ttk.Label(right, text="Analysis Board", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        eng = ttk.Frame(right)
+        eng.grid(row=1, column=0, sticky="ew", pady=4)
+        ttk.Checkbutton(eng, text="Engine analysis (shows the evaluation bar)", variable=self.engine_on,
+                        command=self.on_toggle_engine).pack(side="left")
+        ttk.Label(eng, text="  Lines:").pack(side="left")
+        ttk.Spinbox(eng, from_=1, to=5, width=3, textvariable=self.lines_var,
+                    command=self.request_live).pack(side="left", padx=4)
+        self.lines = make_text(right, height=7)
+        self.lines.grid(row=2, column=0, sticky="ew")
+        self.lines.configure(state="disabled", font=(("Consolas" if IS_WINDOWS else "DejaVu Sans Mono"), 9))
+        self.nb = ttk.Notebook(right)
+        self.nb.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
+        tab_play = ttk.Frame(self.nb)
+        tab_edit = ttk.Frame(self.nb)
+        self.nb.add(tab_play, text="Moves")
+        self.nb.add(tab_edit, text="Board editor")
+        self._build_play_tab(tab_play)
+        self._build_edit_tab(tab_edit)
+        self.nb.bind("<<NotebookTabChanged>>", self.on_tab)
+
+    def _build_play_tab(self, tab: ttk.Frame) -> None:
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(2, weight=1)
+        frow = ttk.Frame(tab)
+        frow.grid(row=0, column=0, sticky="ew", pady=4)
+        frow.columnconfigure(0, weight=1)
+        ttk.Entry(frow, textvariable=self.fen_var).grid(row=0, column=0, sticky="ew")
+        ttk.Button(frow, text="Load FEN", command=self.load_fen_entry, width=9).grid(row=0, column=1, padx=2)
+        ttk.Button(frow, text="Copy FEN", command=self.copy_fen, width=9).grid(row=0, column=2)
+        brow = ttk.Frame(tab)
+        brow.grid(row=1, column=0, sticky="ew")
+        ttk.Button(brow, text="Paste FEN or PGN", style="Accent.TButton", command=self.paste).pack(side="left", padx=2)
+        ttk.Button(brow, text="Start position", command=self.reset).pack(side="left", padx=2)
+        ttk.Button(brow, text="Undo move", command=self.undo).pack(side="left", padx=2)
+        ttk.Button(brow, text="Copy moves", command=self.copy_moves).pack(side="left", padx=2)
+        self.listbox = tk.Listbox(tab, bg=PANEL2, fg=FG, selectbackground="#4b6fa5", selectforeground="#ffffff",
+                                  relief="flat", highlightthickness=0, activestyle="none", exportselection=False,
+                                  font=(UI_FONT, 10))
+        self.listbox.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
+        sb = ttk.Scrollbar(tab, orient="vertical", command=self.listbox.yview)
+        sb.grid(row=2, column=1, sticky="ns", pady=(6, 0))
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.bind("<<ListboxSelect>>", self.on_list_select)
+
+    def _build_edit_tab(self, tab: ttk.Frame) -> None:
+        ttk.Label(tab, text="Pick a piece, then click or drag across squares to place it. "
+                  "Right-click (or the Erase brush) removes pieces.", style="Muted.TLabel", wraplength=360
+                  ).grid(row=0, column=0, sticky="w", pady=4)
+        pal = ttk.Frame(tab)
+        pal.grid(row=1, column=0, sticky="w")
+        for r, symbols in enumerate(("KQRBNP", "kqrbnp")):
+            for c, sym in enumerate(symbols):
+                piece = chess.Piece.from_symbol(sym)
+                white = sym.isupper()
+                tk.Radiobutton(pal, text=GLYPHS[piece.piece_type], variable=self.brush, value=sym, indicatoron=0,
+                               font=(PIECE_FONT, 20), width=2, bg="#dddddd" if white else "#555555",
+                               fg="#111111" if white else "#ffffff", selectcolor="#81b64c",
+                               activebackground="#bbbbbb" if white else "#777777", relief="raised"
+                               ).grid(row=r, column=c, padx=2, pady=2)
+        tk.Radiobutton(pal, text="Erase", variable=self.brush, value="x", indicatoron=0, width=7, height=3,
+                       bg="#3a3836", fg=FG, selectcolor="#ca3431", relief="raised"
+                       ).grid(row=0, column=6, rowspan=2, padx=6)
+        meta = ttk.Frame(tab)
+        meta.grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Label(meta, text="Side to move:").grid(row=0, column=0, sticky="w")
+        for i, name in enumerate(("White", "Black")):
+            ttk.Radiobutton(meta, text=name, variable=self.turn_var, value=name,
+                            command=self._edit_meta).grid(row=0, column=1 + i, padx=4)
+        ttk.Label(meta, text="Castling:").grid(row=1, column=0, sticky="w")
+        for i, (key, label) in enumerate((("K", "White short"), ("Q", "White long"),
+                                          ("k", "Black short"), ("q", "Black long"))):
+            ttk.Checkbutton(meta, text=label, variable=self.castle[key], command=self._edit_meta
+                            ).grid(row=1 + i // 2, column=1 + i % 2, sticky="w", padx=4)
+        btns = ttk.Frame(tab)
+        btns.grid(row=3, column=0, sticky="w", pady=4)
+        ttk.Button(btns, text="Clear board", command=self._edit_clear).pack(side="left", padx=2)
+        ttk.Button(btns, text="Starting position", command=self._edit_start).pack(side="left", padx=2)
+        ttk.Button(btns, text="Current position", command=self._edit_current).pack(side="left", padx=2)
+        ttk.Button(tab, text="Done - analyze this position", style="Accent.TButton",
+                   command=lambda: self.nb.select(0)).grid(row=4, column=0, sticky="w", pady=6, padx=2)
+        self.edit_status = ttk.Label(tab, text="", wraplength=380)
+        self.edit_status.grid(row=5, column=0, sticky="w")
+
+    # ---- state ----
+    def set_flip(self, flipped: bool) -> None:
+        self.view.flipped = flipped
+        self.evalbar.flipped = flipped
+        self.view.redraw()
+        self.evalbar.draw()
+
+    def flip(self) -> None:
+        self.set_flip(not self.view.flipped)
+
+    def set_line(self, start: chess.Board, moves: list, pos: int) -> None:
+        self.start_board = start.copy(stack=False)
+        self.moves = list(moves)
+        self.boards = [self.start_board.copy()]
+        for mv in self.moves:
+            nb = self.boards[-1].copy()
+            nb.push(mv)
+            self.boards.append(nb)
+        self.pos = max(0, min(len(self.moves), pos))
+        if self.editing:
+            self.nb.select(0)
+        self.after_change()
+
+    def set_start(self, board: chess.Board) -> None:
+        self.set_line(board, [], 0)
+
+    def reset(self) -> None:
+        self.set_start(chess.Board())
+
+    def undo(self) -> None:
+        if self.pos > 0:
+            self.pos -= 1
+            del self.moves[self.pos:]
+            del self.boards[self.pos + 1:]
+            self.after_change()
+
+    def goto(self, idx: int) -> None:
+        if self.editing:
+            return
+        new = max(0, min(len(self.moves), idx))
+        if new != self.pos:
+            self.pos = new
+            self.after_change(rebuild=False)
+
+    def step(self, direction: int) -> None:
+        self.goto(self.pos + direction)
+
+    def on_user_move(self, move: chess.Move) -> None:
+        cur = self.boards[self.pos]
+        if self.editing or move not in cur.legal_moves:
+            return
+        self.app.play_sound("capture" if cur.is_capture(move) else "move")
+        if self.pos < len(self.moves) and self.moves[self.pos] == move:
+            self.pos += 1
+            self.after_change(rebuild=False)
+            return
+        del self.moves[self.pos:]
+        del self.boards[self.pos + 1:]
+        nb = cur.copy()
+        nb.push(move)
+        self.moves.append(move)
+        self.boards.append(nb)
+        self.pos += 1
+        self.after_change()
+
+    @staticmethod
+    def _status_text(b: chess.Board) -> str:
+        if b.is_checkmate():
+            return f"Checkmate - {'Black' if b.turn == chess.WHITE else 'White'} wins"
+        if b.is_stalemate():
+            return "Stalemate"
+        if b.is_insufficient_material():
+            return "Draw - insufficient material"
+        return f"{'White' if b.turn == chess.WHITE else 'Black'} to move" + (" (check)" if b.is_check() else "")
+
+    def after_change(self, rebuild: bool = True) -> None:
+        b = self.boards[self.pos]
+        last = self.moves[self.pos - 1] if self.pos > 0 else None
+        self.view.set_position(b, last)
+        self.fen_var.set(b.fen())
+        self.status.configure(text=self._status_text(b))
+        if rebuild:
+            self._rebuild_list()
+        else:
+            self._select_list()
+        self.request_live()
+
+    def _rebuild_list(self) -> None:
+        self.listbox.delete(0, "end")
+        self.listbox.insert("end", "Start position")
+        for i, mv in enumerate(self.moves):
+            b = self.boards[i]
+            self.listbox.insert("end", f"{b.fullmove_number}{'.' if b.turn == chess.WHITE else '...'} {b.san(mv)}")
+        self._select_list()
+
+    def _select_list(self) -> None:
+        self.listbox.selection_clear(0, "end")
+        if self.pos < self.listbox.size():
+            self.listbox.selection_set(self.pos)
+            self.listbox.see(self.pos)
+
+    def on_list_select(self, _e) -> None:
+        sel = self.listbox.curselection()
+        if sel and not self.editing and sel[0] != self.pos:
+            self.pos = sel[0]
+            self.after_change(rebuild=False)
+
+    # ---- loading positions ----
+    def load_fen_entry(self) -> None:
+        self._load_fen(self.fen_var.get().strip())
+
+    def _load_fen(self, text: str) -> bool:
+        try:
+            board = chess.Board(text)
+        except ValueError as exc:
+            messagebox.showerror("Invalid Forsyth-Edwards Notation (FEN)", str(exc))
+            return False
+        if not board.is_valid():
+            messagebox.showerror("Invalid position", "That position is illegal: " + ", ".join(
+                s.name for s in chess.Status if s & board.status()))
+            return False
+        self.set_start(board)
+        return True
+
+    def copy_fen(self) -> None:
+        self.app.root.clipboard_clear()
+        self.app.root.clipboard_append(self.boards[self.pos].fen())
+
+    def copy_moves(self) -> None:
+        if not self.moves:
+            messagebox.showinfo(APP_NAME, "There are no moves to copy.")
+            return
+        board = self.start_board.copy(stack=False)
+        tokens = []
+        for move in self.moves:
+            if move not in board.legal_moves:
+                messagebox.showerror(APP_NAME, "The move list contains an illegal move and cannot be copied.")
+                return
+            if board.turn == chess.WHITE:
+                tokens.append(f"{board.fullmove_number}.")
+            elif not tokens:
+                tokens.append(f"{board.fullmove_number}...")
+            tokens.append(board.san(move))
+            board.push(move)
+        try:
+            self.app.root.clipboard_clear()
+            self.app.root.clipboard_append(" ".join(tokens))
+        except tk.TclError as exc:
+            messagebox.showerror("Could not copy moves", str(exc))
+            return
+        self.status.configure(text=f"Copied {len(self.moves)} moves to the clipboard.")
+
+    def paste(self) -> None:
+        text = clipboard_text(self.app.root).strip()
+        if not text:
+            messagebox.showinfo(APP_NAME, "The clipboard is empty.")
+            return
+        if "\n" not in text and text.count("/") >= 7:
+            self._load_fen(text)
+            return
+        games, messages = parse_pgn_text(text)
+        if not games:
+            messagebox.showerror("Could not read the clipboard", "\n".join(messages[:6]))
+            return
+        game = games[0]
+        try:
+            start = game.board()
+            self.set_line(start, list(game.mainline_moves()), 0)
+        except (ValueError, AssertionError) as exc:
+            messagebox.showerror("Invalid game", str(exc))
+
+    # ---- board editor ----
+    def on_tab(self, _e) -> None:
+        index = self.nb.index(self.nb.select())
+        if index == 1 and not self.editing:
+            self._enter_edit()
+        elif index == 0 and self.editing:
+            if not self._finish_edit():
+                self.nb.select(1)
+
+    def _enter_edit(self) -> None:
+        self.stop_live()
+        self.live_token += 1
+        self.editing = True
+        self.edit_board = self.boards[self.pos].copy(stack=False)
+        self.view.edit_handler = self.on_edit_square
+        self.view.arrow = None
+        self._sync_edit_controls()
+        self._edit_refresh()
+
+    def _sync_edit_controls(self) -> None:
+        b = self.edit_board
+        self.turn_var.set("White" if b.turn == chess.WHITE else "Black")
+        self.castle["K"].set(bool(b.has_kingside_castling_rights(chess.WHITE)))
+        self.castle["Q"].set(bool(b.has_queenside_castling_rights(chess.WHITE)))
+        self.castle["k"].set(bool(b.has_kingside_castling_rights(chess.BLACK)))
+        self.castle["q"].set(bool(b.has_queenside_castling_rights(chess.BLACK)))
+
+    def _finish_edit(self) -> bool:
+        board = self.edit_board
+        board.ep_square = None
+        board.castling_rights = board.clean_castling_rights()
+        status = board.status()
+        if status != chess.STATUS_VALID:
+            messagebox.showerror("Invalid position", "The position cannot be used:\n" +
+                                 ", ".join(s.name for s in chess.Status if s & status).replace("_", " ").lower())
+            return False
+        self.editing = False
+        self.view.edit_handler = None
+        self.set_start(board)
+        return True
+
+    def on_edit_square(self, square: int, erase: bool) -> None:
+        if erase or self.brush.get() == "x":
+            self.edit_board.remove_piece_at(square)
+        else:
+            self.edit_board.set_piece_at(square, chess.Piece.from_symbol(self.brush.get()))
+        self._edit_refresh()
+
+    def _edit_meta(self) -> None:
+        self.edit_board.turn = self.turn_var.get() == "White"
+        flags = "".join(k for k in "KQkq" if self.castle[k].get())
+        try:
+            self.edit_board.set_castling_fen(flags or "-")
+        except ValueError as exc:
+            sys.stderr.write(f"Castling rights ignored: {exc}\n")
+        self._edit_refresh()
+
+    def _edit_refresh(self) -> None:
+        self.edit_board.ep_square = None
+        self.view.set_position(self.edit_board)
+        status = self.edit_board.status()
+        if status == chess.STATUS_VALID:
+            self.edit_status.configure(text="Position is valid.", foreground=ACCENT)
+        else:
+            names = ", ".join(s.name.replace("_", " ").lower() for s in chess.Status if s & status)
+            self.edit_status.configure(text=f"Not valid yet: {names}", foreground="#e6912c")
+
+    def _edit_clear(self) -> None:
+        self.edit_board = chess.Board(None)
+        self._sync_edit_controls()
+        self._edit_refresh()
+
+    def _edit_start(self) -> None:
+        self.edit_board = chess.Board()
+        self._sync_edit_controls()
+        self._edit_refresh()
+
+    def _edit_current(self) -> None:
+        self.edit_board = self.boards[self.pos].copy(stack=False)
+        self._sync_edit_controls()
+        self._edit_refresh()
+
+    # ---- live engine analysis ----
+    def on_show(self) -> None:
+        self.request_live()
+
+    def on_hide(self) -> None:
+        self.stop_live()
+        self.live_token += 1
+
+    def stop_live(self) -> None:
+        self.live_stop.set()
+
+    def _set_lines(self, text: str) -> None:
+        set_readonly_text(self.lines, text)
+
+    def on_toggle_engine(self) -> None:
+        if self.engine_on.get():
+            if not self.app.ensure_engine():
+                self.engine_on.set(False)
+                return
+            self.evalbar.grid()
+            self.request_live()
+        else:
+            self.stop_live()
+            self.live_token += 1
+            self.evalbar.grid_remove()
+            self.view.arrow = None
+            self.view.redraw()
+            self._set_lines("")
+
+    def request_live(self) -> None:
+        self.stop_live()
+        self.live_token += 1
+        if not self.engine_on.get() or self.editing or self.app.current_page != "board":
+            return
+        board = self.boards[self.pos]
+        if board.is_game_over():
+            self._show_terminal(board)
+            return
+        if not (self.app.engine.alive or self.app.engine.path):
+            return
+        self._set_lines("Analyzing...")
+        self.live_stop = threading.Event()
+        try:
+            multipv = max(1, min(5, int(self.lines_var.get())))
+        except (tk.TclError, ValueError):
+            multipv = 3
+        threading.Thread(target=self._live_worker, daemon=True,
+                         args=(self.live_token, board.copy(stack=False), multipv, self.live_stop)).start()
+
+    def _show_terminal(self, board: chess.Board) -> None:
+        if board.is_checkmate():
+            white_lost = board.turn == chess.WHITE
+            self.evalbar.set_eval(-MATE_CP if white_lost else MATE_CP, "0-1" if white_lost else "1-0")
+        else:
+            self.evalbar.set_eval(0, "1/2")
+        self.view.arrow = None
+        self.view.redraw()
+        self._set_lines(self._status_text(board))
+
+    def _live_worker(self, token: int, board: chess.Board, multipv: int, stop: threading.Event) -> None:
+        q = self.app.ui_queue
+        fen = board.fen()
+
+        def on_info(infos: list) -> None:
+            rows = []
+            for info in infos:
+                white = info["score"].white()
+                label = f"#{white.mate()}" if white.is_mate() else f"{white.score() / 100:+.2f}"
+                rows.append({"cp": score_to_cp(white), "label": label, "depth": info.get("depth", 0),
+                             "pv": [m.uci() for m in info.get("pv", [])]})
+            q.put(("live_info", token, fen, rows))
+
+        try:
+            self.app.engine.stream(board, multipv, stop, on_info)
+        except Exception as exc:  # worker boundary
+            q.put(("live_error", token, f"{type(exc).__name__}: {exc}"))
+
+    def on_live(self, msg) -> None:
+        if msg[1] != self.live_token or not self.engine_on.get() or self.editing:
+            return
+        board = self.boards[self.pos]
+        rows = msg[3]
+        if msg[2] != board.fen() or not rows:
+            return
+        top = rows[0]
+        self.evalbar.set_eval(top["cp"], top["label"])
+        self._set_lines("\n".join(f"{r['label']:>7}  d{r['depth']:<2} {pv_to_san(board, r['pv'])}" for r in rows))
+        try:
+            self.view.arrow = chess.Move.from_uci(top["pv"][0]) if top["pv"] else None
+        except ValueError:
+            self.view.arrow = None
+        if self.view.mode is None:
+            self.view.redraw()
+
+    def on_live_error(self, msg) -> None:
+        if msg[1] != self.live_token:
+            return
+        self.engine_on.set(False)
+        self.on_toggle_engine()
+        self._set_lines(f"Engine error: {msg[2]}")
+
+
+# =============================================================================
 # 14. PLAY AGAINST THE OFFLINE ARTIFICIAL INTELLIGENCE OPPONENT
 # =============================================================================
 class PlayPage(ttk.Frame):
@@ -1827,6 +2642,7 @@ class PlayPage(ttk.Frame):
         self.human = chess.WHITE
         self.over = False
         self.thinking = False
+        self.result = "*"
         self.token = 0
         self.redo_stack: list[chess.Move] = []
         self.columnconfigure(0, weight=5)
@@ -1847,7 +2663,7 @@ class PlayPage(ttk.Frame):
         right = ttk.Frame(self)
         right.grid(row=0, column=1, sticky="nsew", pady=8, padx=(0, 8))
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(9, weight=1)
+        right.rowconfigure(10, weight=1)
         ttk.Label(right, text="Play against Stockfish (offline)", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         row = ttk.Frame(right)
         row.grid(row=1, column=0, sticky="ew", pady=4)
@@ -1878,13 +2694,15 @@ class PlayPage(ttk.Frame):
                                  ("Redo", self.redo, "TButton"), ("Resign", self.resign, "TButton"),
                                  ("Flip", lambda: self.view.set_flipped(not self.view.flipped), "TButton")):
             ttk.Button(btns, text=text, command=cmd, style=style, width=8).pack(side="left", padx=2)
+        ttk.Button(right, text="Review game with engine", command=self.review, style="Accent.TButton"
+                   ).grid(row=8, column=0, sticky="ew", pady=(0, 4))
         self.status = ttk.Label(right, text="Press New game to start.", style="Big.TLabel", wraplength=330)
-        self.status.grid(row=8, column=0, sticky="w")
+        self.status.grid(row=9, column=0, sticky="w")
         self.history = make_text(right, height=10)
-        self.history.grid(row=9, column=0, sticky="nsew", pady=4)
+        self.history.grid(row=10, column=0, sticky="nsew", pady=4)
         self.history.configure(state="disabled")
         self.think_bar = ttk.Progressbar(right, mode="indeterminate")
-        self.think_bar.grid(row=10, column=0, sticky="ew")
+        self.think_bar.grid(row=11, column=0, sticky="ew")
         app.register("ai_move", self.on_ai_move)
         app.register("ai_error", self.on_ai_error)
         self.refresh()
@@ -1909,7 +2727,8 @@ class PlayPage(ttk.Frame):
         choice = self.color_var.get()
         self.human = random.choice([chess.WHITE, chess.BLACK]) if choice == "Random" else (choice == "White")
         self.view.flipped = not self.human
-        self.over, self.thinking = False, False
+        self.over, self.thinking, self.result = False, False, "*"
+        self.think_bar.stop()
         self.redo_stack.clear()
         self.app.settings.data["ai_elo"] = int(self.elo.get())
         self.refresh()
@@ -1977,6 +2796,7 @@ class PlayPage(ttk.Frame):
         if outcome is None:
             return False
         self.over = True
+        self.result = outcome.result()
         reason = outcome.termination.name.replace("_", " ").title()
         if outcome.winner is None:
             text = f"Draw ({reason})."
@@ -1984,7 +2804,29 @@ class PlayPage(ttk.Frame):
             text = f"{'You win' if outcome.winner == self.human else 'The engine wins'} - {reason}."
         self.status.configure(text=text)
         self.app.play_sound("end")
+        self.after(400, self._offer_review)
         return True
+
+    def _offer_review(self) -> None:
+        if self.board.move_stack and messagebox.askyesno(
+                "Game over", f"{self.status.cget('text')}\n\nReview this game with the engine now?"):
+            self.review()
+
+    def review(self) -> None:
+        if not self.board.move_stack:
+            messagebox.showinfo(APP_NAME, "Play at least one move first.")
+            return
+        self.token += 1
+        self.thinking = False
+        self.think_bar.stop()
+        game = chess.pgn.Game.from_board(self.board)
+        ai_name = f"Stockfish (about {int(self.elo.get())})"
+        game.headers["Event"] = "Play vs AI"
+        game.headers["Date"] = datetime.date.today().strftime("%Y.%m.%d")
+        game.headers["White"] = "You" if self.human == chess.WHITE else ai_name
+        game.headers["Black"] = "You" if self.human == chess.BLACK else ai_name
+        game.headers["Result"] = self.result
+        self.app.review_game(game)
 
     def undo(self) -> None:
         if not self.board.move_stack:
@@ -1995,7 +2837,7 @@ class PlayPage(ttk.Frame):
         count = 2 if self.board.turn == self.human else 1
         for _ in range(min(count, len(self.board.move_stack))):
             self.redo_stack.append(self.board.pop())
-        self.over = False
+        self.over, self.result = False, "*"
         self.refresh()
         if self.board.turn != self.human:
             self._request_ai()
@@ -2014,14 +2856,16 @@ class PlayPage(ttk.Frame):
             self._request_ai()
 
     def resign(self) -> None:
-        if self.over or not self.board.move_stack and self.board.turn == self.human:
+        if self.over or (not self.board.move_stack and self.board.turn == self.human):
             return
         if messagebox.askyesno("Resign", "Do you really want to resign this game?"):
             self.token += 1
             self.thinking, self.over = False, True
+            self.result = "0-1" if self.human == chess.WHITE else "1-0"
             self.think_bar.stop()
             self.status.configure(text="You resigned. The engine wins.")
             self.refresh()
+            self.after(400, self._offer_review)
 
     def refresh(self) -> None:
         last = self.board.peek() if self.board.move_stack else None
@@ -2032,10 +2876,7 @@ class PlayPage(ttk.Frame):
             history = chess.Board(self.start_fen).variation_san(self.board.move_stack)
         except ValueError as exc:
             history = f"(history unavailable: {exc})"
-        self.history.configure(state="normal")
-        self.history.delete("1.0", "end")
-        self.history.insert("1.0", history)
-        self.history.configure(state="disabled")
+        set_readonly_text(self.history, history)
         self.cap_you.configure(text="You captured: " + self._captured(self.human))
         self.cap_ai.configure(text="Engine captured: " + self._captured(not self.human))
 
@@ -2073,10 +2914,7 @@ class ReportPage(ttk.Frame):
         return build_report(analysis, self.app.settings.data["accuracy_k"])
 
     def refresh(self) -> None:
-        self.text.configure(state="normal")
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", self._content())
-        self.text.configure(state="disabled")
+        set_readonly_text(self.text, self._content())
 
     def export(self) -> None:
         path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text", "*.txt")])
@@ -2342,6 +3180,10 @@ class EngineInstallDialog(tk.Toplevel):
 # =============================================================================
 # 15. APPLICATION CONTROLLER
 # =============================================================================
+TEXT_INPUT_CLASSES = (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox, ttk.Spinbox)
+SCROLLING_CLASSES = (tk.Text, tk.Listbox, ttk.Treeview, tk.Scale, ttk.Combobox, ttk.Spinbox, tk.Entry, ttk.Entry)
+
+
 class ChessApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
@@ -2349,6 +3191,8 @@ class ChessApp:
         self.root.geometry("1380x880")
         self.root.minsize(1100, 720)
         setup_style(self.root)
+        self.root.report_callback_exception = self.on_tk_error
+        self._error_dialog_shown = False
         self.settings = Settings()
         self.settings_warning = self.settings.load()
         self.ui_queue: queue.Queue = queue.Queue()
@@ -2364,8 +3208,8 @@ class ChessApp:
         ttk.Label(side, text=APP_NAME, style="Title.TLabel", background=BG, foreground=ACCENT
                   ).pack(padx=14, pady=(14, 18))
         self.nav: dict = {}
-        for key, text in (("analysis", "PGN Analysis"), ("play", "Play vs AI"), ("report", "Analysis Dashboard"),
-                          ("settings", "Settings"), ("engine", "Engine Status")):
+        for key, text in (("analysis", "PGN Analysis"), ("board", "Analysis Board"), ("play", "Play vs AI"),
+                          ("report", "Analysis Dashboard"), ("settings", "Settings"), ("engine", "Engine Status")):
             btn = ttk.Button(side, text=text, style="Side.TButton", command=lambda k=key: self.show_page(k))
             btn.pack(fill="x")
             self.nav[key] = btn
@@ -2378,6 +3222,7 @@ class ChessApp:
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
         self.pages["analysis"] = AnalysisPage(self.content, self)
+        self.pages["board"] = BoardPage(self.content, self)
         self.pages["play"] = PlayPage(self.content, self)
         self.pages["report"] = ReportPage(self.content, self)
         self.pages["settings"] = SettingsPage(self.content, self)
@@ -2386,14 +3231,81 @@ class ChessApp:
             page.grid(row=0, column=0, sticky="nsew")
         self.show_page("analysis")
         self.apply_settings()
+        self._bind_inputs()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(40, self.poll_queue)
         self.root.after(250, self.startup)
 
+    # ---- plumbing ----
     def register(self, kind: str, fn: Callable) -> None:
         self.handlers[kind] = fn
 
+    def on_tk_error(self, exc, val, tb) -> None:
+        text = "".join(traceback.format_exception(exc, val, tb))
+        sys.stderr.write(text)
+        try:
+            with open(ERROR_LOG, "a", encoding="utf-8") as handle:
+                handle.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n{text}\n")
+        except OSError as io_exc:
+            sys.stderr.write(f"Could not write the error log: {io_exc}\n")
+        self.status_bar.configure(text=f" An internal error occurred ({val}). Details: {ERROR_LOG.name}")
+        if not self._error_dialog_shown:
+            self._error_dialog_shown = True
+            messagebox.showerror("Unexpected error", f"{val}\n\nThe application keeps running. Details were "
+                                 f"written to {ERROR_LOG.name}.")
+
+    def _bind_inputs(self) -> None:
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.bind_all(sequence, self.on_wheel)
+        self.root.bind("<Left>", lambda e: self.on_key(-1))
+        self.root.bind("<Right>", lambda e: self.on_key(1))
+        self.root.bind("<Control-v>", self.on_paste_key)
+        try:
+            self.root.bind("<Command-v>", self.on_paste_key)
+        except tk.TclError as exc:
+            sys.stderr.write(f"Command key binding skipped: {exc}\n")
+
+    def _focus_in_text_input(self) -> bool:
+        try:
+            return isinstance(self.root.focus_get(), TEXT_INPUT_CLASSES)
+        except KeyError:
+            return True
+
+    def on_key(self, direction: int) -> None:
+        page = self.pages.get(self.current_page)
+        if page is not None and hasattr(page, "step") and not self._focus_in_text_input():
+            page.step(direction)
+
+    def on_wheel(self, event) -> None:
+        page = self.pages.get(self.current_page)
+        if page is None or not hasattr(page, "step"):
+            return
+        try:
+            widget = self.root.winfo_containing(event.x_root, event.y_root)
+        except KeyError:
+            return
+        if widget is None or isinstance(widget, SCROLLING_CLASSES):
+            return
+        if getattr(event, "num", None) == 4:
+            direction = -1
+        elif getattr(event, "num", None) == 5:
+            direction = 1
+        else:
+            direction = -1 if event.delta > 0 else 1
+        page.step(direction)
+
+    def on_paste_key(self, _event=None) -> None:
+        if self._focus_in_text_input():
+            return
+        if self.current_page == "analysis":
+            self.pages["analysis"].paste_text()
+        elif self.current_page == "board":
+            self.pages["board"].paste()
+
     def show_page(self, key: str) -> None:
+        previous = self.pages.get(self.current_page)
+        if previous is not None and self.current_page != key and hasattr(previous, "on_hide"):
+            previous.on_hide()
         self.current_page = key
         self.pages[key].tkraise()
         for k, btn in self.nav.items():
@@ -2402,6 +3314,16 @@ class ChessApp:
             self.pages["report"].refresh()
         if key == "engine":
             self.pages["engine"].refresh()
+        if hasattr(self.pages[key], "on_show"):
+            self.pages[key].on_show()
+
+    def review_game(self, game) -> None:
+        self.show_page("analysis")
+        self.pages["analysis"].load_game_object(game, autostart=True)
+
+    def open_in_board(self, start: chess.Board, moves: list, pos: int) -> None:
+        self.pages["board"].set_line(start, moves, pos)
+        self.show_page("board")
 
     def poll_queue(self) -> None:
         """Only the GUI thread touches widgets; workers communicate exclusively through this queue."""
@@ -2412,8 +3334,8 @@ class ChessApp:
                 if handler:
                     try:
                         handler(msg)
-                    except Exception:  # keep the event loop alive; show the traceback on the console
-                        traceback.print_exc()
+                    except Exception:  # keep the event loop alive; log the traceback
+                        self.on_tk_error(*sys.exc_info())
         except queue.Empty:
             pass
         if not self.closing:
@@ -2421,12 +3343,11 @@ class ChessApp:
 
     def apply_settings(self) -> None:
         d = self.settings.data
-        for key in ("analysis", "play"):
+        for key in ("analysis", "board", "play"):
             self.pages[key].view.redraw()
-        if "analysis" in self.pages:
-            self.pages["analysis"].view.flipped = d["flip_board"]
-            self.pages["analysis"].view.redraw()
-            self.pages["analysis"].depth_var.set(d["depth"])
+        self.pages["analysis"].set_flip(d["flip_board"])
+        self.pages["board"].set_flip(d["flip_board"])
+        self.pages["analysis"].depth_var.set(d["depth"])
         self.engine.clear_cache()
         path = d["engine_path"]
         if path and path != self.engine.path and Path(path).is_file():
@@ -2444,6 +3365,7 @@ class ChessApp:
                 sys.stderr.write(f"Sound unavailable: {exc}\n")
         self.root.bell()
 
+    # ---- engine control ----
     def update_engine_status(self) -> None:
         e = self.engine
         self.status_bar.configure(text=f" Engine: {e.name} - ready" if e.alive else
@@ -2522,6 +3444,7 @@ class ChessApp:
     def on_close(self) -> None:
         self.closing = True
         self.pages["analysis"].cancel.set()
+        self.pages["board"].stop_live()
         self.pages["play"].token += 1
         self.engine.shutdown()
         self.root.destroy()
